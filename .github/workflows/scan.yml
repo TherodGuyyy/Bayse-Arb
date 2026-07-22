@@ -1,0 +1,35 @@
+name: Bayse Arb Scan
+
+# Runs every 15 minutes automatically, and can also be triggered manually
+# from the Actions tab in GitHub (the "Run workflow" button) for testing.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run a single scan
+        run: python main.py
+        env:
+          RUN_ONCE: "true"
+          BAYSE_PUBLIC_KEY: ${{ secrets.BAYSE_PUBLIC_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_DAYS_TO_RESOLUTION: "7"
+          MIN_PROFIT_MARGIN: "0.01"
+          FEE_BUFFER: "0.02"
+          ALERT_COOLDOWN_SECONDS: "600"
