@@ -85,18 +85,55 @@ class BayseClient:
         log.warning("Unexpected /v1/pm/events response shape: keys=%s", list(data.keys()))
         return []
 
-    def list_all_events(self) -> list[dict]:
-        """Page through all events."""
+    def list_all_events(self, max_pages: int = 50) -> list[dict]:
+        """
+        Page through all events.
+
+        Hard-capped at max_pages (default 50, i.e. up to 5000 events at the
+        default page size) so this can never loop forever if Bayse's real
+        pagination behavior doesn't match what's assumed here (e.g. if it
+        ever returns a full page repeatedly instead of eventually returning
+        a shorter final page). If the cap is hit, we log a warning and
+        return what we have rather than hanging indefinitely.
+        """
         all_events = []
         offset = 0
-        while True:
+        pages_fetched = 0
+        seen_first_ids_per_page = set()
+
+        while pages_fetched < max_pages:
             page = self.list_events(offset=offset)
+            pages_fetched += 1
+
             if not page:
                 break
+
+            # Extra guard: if the "next" page is identical to a page we've
+            # already seen (same first event's id), pagination likely isn't
+            # advancing — stop instead of looping forever.
+            first_id = get_field(page[0], "event_id")
+            if first_id in seen_first_ids_per_page:
+                log.warning(
+                    "Pagination doesn't seem to be advancing (repeated page at "
+                    "offset=%d) — stopping early. Check the offset/limit param "
+                    "names against Bayse's real API.", offset,
+                )
+                break
+            seen_first_ids_per_page.add(first_id)
+
             all_events.extend(page)
             if len(page) < config.EVENTS_PAGE_LIMIT:
                 break
             offset += config.EVENTS_PAGE_LIMIT
+
+        if pages_fetched >= max_pages:
+            log.warning(
+                "Hit the %d-page safety cap while fetching events — there may be "
+                "more events than we fetched this pass. This is a safeguard, not "
+                "expected behavior; worth checking Bayse's real pagination shape.",
+                max_pages,
+            )
+
         return all_events
 
     def get_event(self, event_id: str) -> dict:
@@ -112,3 +149,5 @@ if __name__ == "__main__":
     events = client.list_events(limit=1)
     import json
     print(json.dumps(events, indent=2))
+"""
+
