@@ -149,5 +149,3 @@ if __name__ == "__main__":
     events = client.list_events(limit=1)
     import json
     print(json.dumps(events, indent=2))
-"""
-
