@@ -28,7 +28,7 @@ import logging
 from dateutil import parser as dateparser
 
 import config
-from bayse_client import get_field
+from bayse_client import get_field, get_field_with_source, get_yes_no_prices
 
 log = logging.getLogger("arbitrage")
 
@@ -87,77 +87,103 @@ def within_resolution_window(raw_event: dict, max_days: int = None) -> bool:
 
 def get_effective_fee(raw_event_or_market: dict) -> float:
     """
-    Best-effort fee lookup. Falls back to config.FEE_BUFFER if the fee field
-    isn't found on the object (see bayse_client.FIELD_ALIASES to fix this
-    once you've confirmed the real field name from a live response).
+    Best-effort fee lookup, now using the CONFIRMED real Bayse field name
+    (verified from a live event dump on 2026-07-27): "feePercentage" — and
+    critically, that field means a literal percentage (a value of 10 means
+    10%), NOT basis points. The previous version of this function guessed
+    wrong here: it would have divided by 10,000 (treating 10 as 0.1%)
+    instead of by 100 (the correct interpretation, 10%) — a 100x
+    underestimate that could have made a genuinely unprofitable trade look
+    like a guaranteed-profit arbitrage opportunity. Fixed now that we have
+    real data to confirm against.
+
+    Falls back to config.FEE_BUFFER if no fee field is found at all.
     """
-    fee = get_field(raw_event_or_market, "fee")
+    fee, matched_key = get_field_with_source(raw_event_or_market, "fee")
     if fee is None:
         return config.FEE_BUFFER
-    # Guard against bps vs fraction confusion (e.g. "150" meaning 1.5%).
+
     fee = float(fee)
-    if fee > 1:
-        fee = fee / 10000.0  # assume bps
+
+    if matched_key == "feePercentage":
+        # Confirmed real field: value IS the percentage directly.
+        fee = fee / 100.0
+    elif fee > 1:
+        # Fallback heuristic for any other/older field name this might
+        # match — guess basis points if we don't know for sure.
+        fee = fee / 10000.0
+
     return max(fee, config.FEE_BUFFER)
 
 
-def check_single_market(raw_event: dict) -> Optional[ArbOpportunity]:
-    """Check a plain (non-combined) event/market for YES+NO < 1 - fee."""
-    yes_ask = get_field(raw_event, "yes_ask")
-    no_ask = get_field(raw_event, "no_ask")
-    if yes_ask is None or no_ask is None:
-        return None
-
-    yes_ask, no_ask = float(yes_ask), float(no_ask)
-    fee = get_effective_fee(raw_event)
-    total_cost = yes_ask + no_ask
-    margin = 1.0 - total_cost - fee
-
-    if margin >= config.MIN_PROFIT_MARGIN:
-        return ArbOpportunity(
-            kind="single_market",
-            title=get_field(raw_event, "title") or "Untitled market",
-            event_id=str(get_field(raw_event, "event_id")),
-            resolution_date=_parse_resolution_date(raw_event),
-            legs=[
-                {"label": "YES", "side": "YES", "ask": yes_ask},
-                {"label": "NO", "side": "NO", "ask": no_ask},
-            ],
-            total_cost=total_cost,
-            fee_buffer_applied=fee,
-            profit_margin=margin,
-        )
-    return None
+MIN_PLAUSIBLE_PRICE = 0.01  # a real YES/NO price this close to 0 or 1.00 is
+                             # implausible for an actively-traded market —
+                             # more likely a placeholder/stale value than a
+                             # genuine price.
 
 
-def check_combined_event(raw_event: dict) -> Optional[ArbOpportunity]:
-    """Check a combined event's sub-markets for sum(YES asks) < 1 - fee."""
-    sub_markets = get_field(raw_event, "sub_markets")
-    if not sub_markets or not isinstance(sub_markets, list) or len(sub_markets) < 2:
-        return None
-
+def _check_arbitrage_from_submarkets(raw_event: dict, sub_markets: list) -> Optional[ArbOpportunity]:
+    """
+    Unified arb check for BOTH simple markets and combined events — since
+    the real Bayse structure confirmed on 2026-07-27 shows every event is
+    just a "markets" list of one or more binary sub-markets, there's no
+    real structural difference between them:
+      - 1 sub-market  -> check that single market's Yes+No sum
+      - 2+ sub-markets -> sum each sub-market's Yes price across all of them
+    Each sub-market has its OWN fee (feePercentage) — the max fee found
+    across all legs is used as a single conservative buffer for the whole
+    basket (safer than averaging, since we don't know Bayse's exact
+    per-leg fee mechanics for a multi-leg trade).
+    """
     legs = []
     total_cost = 0.0
-    fee = get_effective_fee(raw_event)
+    fees = []
+    event_title = get_field(raw_event, "title") or "Untitled"
+
+    is_single = len(sub_markets) == 1
 
     for sub in sub_markets:
-        yes_ask = get_field(sub, "yes_ask")
-        if yes_ask is None:
-            return None  # incomplete data — skip rather than guess
-        yes_ask = float(yes_ask)
-        legs.append({
-            "label": get_field(sub, "title") or "Outcome",
-            "side": "YES",
-            "ask": yes_ask,
-        })
-        total_cost += yes_ask
+        yes_price, no_price = get_yes_no_prices(sub)
 
+        if is_single:
+            if yes_price is None or no_price is None:
+                return None
+            if yes_price < MIN_PLAUSIBLE_PRICE or no_price < MIN_PLAUSIBLE_PRICE:
+                log.warning(
+                    "Rejecting '%s' — price too close to 0 to be real "
+                    "(yes=%.4f, no=%.4f). Likely stale/placeholder data.",
+                    event_title, yes_price, no_price,
+                )
+                return None
+            legs.append({"label": "YES", "side": "YES", "ask": yes_price})
+            legs.append({"label": "NO", "side": "NO", "ask": no_price})
+            total_cost += yes_price + no_price
+        else:
+            if yes_price is None:
+                return None  # incomplete data on this leg — skip rather than guess
+            if yes_price < MIN_PLAUSIBLE_PRICE:
+                log.warning(
+                    "Rejecting combined event '%s' — a sub-market's YES price is "
+                    "too close to 0 to be real (%.4f). Likely stale/placeholder data.",
+                    event_title, yes_price,
+                )
+                return None
+            legs.append({
+                "label": get_field(sub, "title") or sub.get("outcome1Label") or "Outcome",
+                "side": "YES",
+                "ask": yes_price,
+            })
+            total_cost += yes_price
+
+        fees.append(get_effective_fee(sub))
+
+    fee = max(fees) if fees else config.FEE_BUFFER
     margin = 1.0 - total_cost - fee
 
     if margin >= config.MIN_PROFIT_MARGIN:
         return ArbOpportunity(
-            kind="combined_event",
-            title=get_field(raw_event, "title") or "Untitled combined event",
+            kind="single_market" if is_single else "combined_event",
+            title=event_title,
             event_id=str(get_field(raw_event, "event_id")),
             resolution_date=_parse_resolution_date(raw_event),
             legs=legs,
@@ -169,11 +195,13 @@ def check_combined_event(raw_event: dict) -> Optional[ArbOpportunity]:
 
 
 def scan_event(raw_event: dict) -> Optional[ArbOpportunity]:
-    """Run the appropriate check depending on whether this is a combined event."""
+    """Entry point: checks one event for an arbitrage opportunity, using the
+    real confirmed structure (a "markets" list of 1+ binary sub-markets)."""
     if not within_resolution_window(raw_event):
         return None
 
     sub_markets = get_field(raw_event, "sub_markets")
-    if sub_markets and isinstance(sub_markets, list) and len(sub_markets) >= 2:
-        return check_combined_event(raw_event)
-    return check_single_market(raw_event)
+    if not sub_markets or not isinstance(sub_markets, list) or len(sub_markets) == 0:
+        return None
+
+    return _check_arbitrage_from_submarkets(raw_event, sub_markets)
