@@ -25,12 +25,16 @@ import config
 log = logging.getLogger("bayse_client")
 
 # Plausible field name variants seen across similar prediction-market APIs.
-# Adjust/add to these once you've inspected a real response.
+# CONFIRMED from a real live Bayse event dump (2026-07-27): "yesBuyPrice",
+# "noBuyPrice", "feePercentage", "resolutionDate", "markets", and "id" are
+# Bayse's actual field names — these are now listed FIRST in each list
+# (still keeping the old guesses as a fallback, in case some endpoints or
+# older/newer API versions differ).
 FIELD_ALIASES = {
     "resolution_date": ["resolutionDate", "resolveDate", "closeTime", "endDate", "expiry"],
-    "yes_ask": ["yesAsk", "yesPrice", "yesAskPrice", "askYes"],
-    "no_ask": ["noAsk", "noPrice", "noAskPrice", "askNo"],
-    "fee": ["takerFeeBps", "takerFee", "feeBps", "fee"],
+    "yes_ask": ["yesBuyPrice", "yesAsk", "yesPrice", "yesAskPrice", "askYes"],
+    "no_ask": ["noBuyPrice", "noAsk", "noPrice", "noAskPrice", "askNo"],
+    "fee": ["feePercentage", "takerFeeBps", "takerFee", "feeBps", "fee"],
     "sub_markets": ["markets", "subMarkets", "outcomes"],
     "event_id": ["id", "eventId"],
     "title": ["title", "name", "question"],
@@ -53,6 +57,19 @@ def get_field(obj: dict, logical_name: str) -> Optional[Any]:
             logical_name, FIELD_ALIASES[logical_name],
         )
     return value
+
+
+def get_field_with_source(obj: dict, logical_name: str) -> tuple[Optional[Any], Optional[str]]:
+    """
+    Same as get_field, but also returns WHICH specific alias key matched —
+    needed for the fee field specifically, since "feePercentage" (a
+    confirmed real Bayse field) means something different numerically than
+    a generic "fee" or "feeBps" field would (percent vs basis points).
+    """
+    for key in FIELD_ALIASES[logical_name]:
+        if key in obj and obj[key] is not None:
+            return obj[key], key
+    return None, None
 
 
 class BayseClient:
