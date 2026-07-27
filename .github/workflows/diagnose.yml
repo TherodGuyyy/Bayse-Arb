@@ -1,0 +1,25 @@
+name: Bayse Field Diagnostic (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Dump one raw Bayse event
+        run: python bayse_client.py
+        env:
+          BAYSE_PUBLIC_KEY: ${{ secrets.BAYSE_PUBLIC_KEY }}
