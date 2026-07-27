@@ -116,6 +116,13 @@ def get_effective_fee(raw_event_or_market: dict) -> float:
     return max(fee, config.FEE_BUFFER)
 
 
+MIN_PLAUSIBLE_PRICE = 0.01  # a real YES/NO price this close to 0 or 1.00 is
+                             # implausible for an actively-traded market —
+                             # more likely a placeholder/stale value than a
+                             # genuine price. Real markets almost always
+                             # show some meaningful two-sided price.
+
+
 def check_single_market(raw_event: dict) -> Optional[ArbOpportunity]:
     """Check a plain (non-combined) event/market for YES+NO < 1 - fee."""
     yes_ask = get_field(raw_event, "yes_ask")
@@ -124,6 +131,21 @@ def check_single_market(raw_event: dict) -> Optional[ArbOpportunity]:
         return None
 
     yes_ask, no_ask = float(yes_ask), float(no_ask)
+
+    # SAFETY CHECK: reject implausible (near-zero) prices rather than treat
+    # them as real. A genuine 0.0000 price on both sides produced a false
+    # "100% guaranteed profit" signal in practice — this data was stale/
+    # placeholder, not a real live price (confirmed against the actual app
+    # showing real non-zero prices for the same market).
+    if yes_ask < MIN_PLAUSIBLE_PRICE or no_ask < MIN_PLAUSIBLE_PRICE:
+        log.warning(
+            "Rejecting event '%s' — price too close to 0 to be real "
+            "(yes=%.4f, no=%.4f). Likely stale/placeholder data from this "
+            "endpoint rather than a genuine live price.",
+            get_field(raw_event, "title"), yes_ask, no_ask,
+        )
+        return None
+
     fee = get_effective_fee(raw_event)
     total_cost = yes_ask + no_ask
     margin = 1.0 - total_cost - fee
@@ -160,6 +182,17 @@ def check_combined_event(raw_event: dict) -> Optional[ArbOpportunity]:
         if yes_ask is None:
             return None  # incomplete data — skip rather than guess
         yes_ask = float(yes_ask)
+
+        # Same safety check as check_single_market — reject implausible
+        # near-zero prices rather than treat them as real.
+        if yes_ask < MIN_PLAUSIBLE_PRICE:
+            log.warning(
+                "Rejecting combined event '%s' — sub-market '%s' price too "
+                "close to 0 to be real (%.4f). Likely stale/placeholder data.",
+                get_field(raw_event, "title"), get_field(sub, "title"), yes_ask,
+            )
+            return None
+
         legs.append({
             "label": get_field(sub, "title") or "Outcome",
             "side": "YES",
